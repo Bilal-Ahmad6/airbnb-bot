@@ -1,0 +1,223 @@
+import logging
+from flask import current_app, jsonify
+import json
+import requests
+
+from app.services.gemini_service import generate_response
+from app.services.voice_handler import (
+    download_audio_from_whatsapp,
+    transcribe_audio,
+    synthesize_speech,
+    send_audio_reply,
+    get_voice_handler
+)
+from app.utils.message_tracker import get_message_tracker
+import re
+
+
+def log_http_response(response):
+    logging.info(f"Status: {response.status_code}")
+    logging.info(f"Content-type: {response.headers.get('content-type')}")
+    logging.info(f"Body: {response.text}")
+
+
+def get_text_message_input(recipient, text):
+    return json.dumps(
+        {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "text",
+            "text": {"preview_url": False, "body": text},
+        }
+    )
+
+
+def send_message(data):
+    headers = {
+        "Content-type": "application/json",
+        "Authorization": f"Bearer {current_app.config['ACCESS_TOKEN']}",
+    }
+
+    url = f"https://graph.facebook.com/{current_app.config['VERSION']}/{current_app.config['PHONE_NUMBER_ID']}/messages"
+
+    try:
+        response = requests.post(
+            url, data=data, headers=headers, timeout=10
+        )  # 10 seconds timeout as an example
+        response.raise_for_status()  # Raises an HTTPError if the HTTP request returned an unsuccessful status code
+    except requests.Timeout:
+        logging.error("Timeout occurred while sending message")
+        return jsonify({"status": "error", "message": "Request timed out"}), 408
+    except (
+        requests.RequestException
+    ) as e:  # This will catch any general request exception
+        logging.error(f"Request failed due to: {e}")
+        return jsonify({"status": "error", "message": "Failed to send message"}), 500
+    else:
+        # Process the response as normal
+        log_http_response(response)
+        return response
+
+
+def process_text_for_whatsapp(text):
+    # Remove brackets
+    pattern = r"\【.*?\】"
+    # Substitute the pattern with an empty string
+    text = re.sub(pattern, "", text).strip()
+
+    # Pattern to find double asterisks including the word(s) in between
+    pattern = r"\*\*(.*?)\*\*"
+
+    # Replacement pattern with single asterisks
+    replacement = r"*\1*"
+
+    # Substitute occurrences of the pattern with the replacement
+    whatsapp_style_text = re.sub(pattern, replacement, text)
+
+    return whatsapp_style_text
+
+
+def process_whatsapp_message(body):
+    """
+    Process incoming WhatsApp messages (text or voice).
+    Responds with text for text messages, and voice for voice messages.
+    """
+    print("🔍 ENTERED process_whatsapp_message()")
+    logging.info("🔍 ENTERED process_whatsapp_message()")
+    
+    wa_id = body["entry"][0]["changes"][0]["value"]["contacts"][0]["wa_id"]
+    name = body["entry"][0]["changes"][0]["value"]["contacts"][0]["profile"]["name"]
+    message = body["entry"][0]["changes"][0]["value"]["messages"][0]
+    
+    # Get message ID and check for duplicates
+    message_id = message.get("id")
+    tracker = get_message_tracker()
+    
+    if tracker.is_processed(message_id):
+        print(f"⚠️ Message {message_id} already processed - skipping duplicate")
+        logging.info(f"⚠️ Duplicate message detected: {message_id} - skipping")
+        return
+    
+    # Mark this message as processed
+    tracker.mark_processed(message_id)
+    print(f"✅ Message {message_id} marked as processed")
+    
+    # Get message type
+    message_type = message.get("type")
+    recipient = current_app.config["RECIPIENT_WAID"]
+    
+    print(f"🔍 DEBUG: Message type = '{message_type}'")
+    print(f"🔍 DEBUG: Recipient = '{recipient}'")
+    logging.info(f"🔍 DEBUG: Message type = '{message_type}'")
+    logging.info(f"🔍 DEBUG: Message keys = {list(message.keys())}")
+    logging.info(f"🔍 DEBUG: Full message = {json.dumps(message, indent=2)}")
+    
+    if message_type == "audio":
+        print(f"🎤 AUDIO DETECTED! Processing voice message from {name}")
+        # Handle voice message
+        logging.info(f"🎤 Voice message received from {name} ({wa_id})")
+        
+        try:
+            print("📥 Step 1: Downloading audio from WhatsApp...")
+            # 1. Download audio from WhatsApp
+            media_id = message["audio"]["id"]
+            print(f"📥 Media ID: {media_id}")
+            audio_path = download_audio_from_whatsapp(media_id)
+            print(f"📥 Audio downloaded to: {audio_path}")
+            
+            if not audio_path:
+                print("❌ Failed to download audio!")
+                logging.error("Failed to download audio")
+                return
+            
+            print("✅ Download successful! Moving to transcription...")
+            
+            # 2. Transcribe audio to text
+            print("🎤 Step 2: Transcribing audio with Gemini...")
+            transcribed_text = transcribe_audio(audio_path)
+            print(f"🎤 Transcription result: {transcribed_text}")
+            
+            if not transcribed_text:
+                print("❌ Transcription failed or empty!")
+                logging.error("Failed to transcribe audio")
+                # Clean up downloaded file
+                get_voice_handler().cleanup_temp_files(audio_path)
+                return
+            
+            print(f"✅ Transcription successful: '{transcribed_text}'")
+            logging.info(f"📝 Transcription from {name}: {transcribed_text}")
+            
+            # 3. Generate AI response using Gemini + RAG
+            print("🤖 Step 3: Generating AI response...")
+            ai_response = generate_response(transcribed_text, wa_id, name)
+            print(f"🤖 AI Response: {ai_response}")
+            ai_response = process_text_for_whatsapp(ai_response)
+            
+            logging.info(f"🤖 AI Response: {ai_response}")
+            
+            # 4. Convert response to speech (UpliftAI returns streaming URL)
+            print("🗣️ Step 4: Synthesizing speech with UpliftAI...")
+            audio_path_tts = synthesize_speech(ai_response)
+            print(f"🗣️ Audio file saved to: {audio_path_tts}")
+            
+            if not audio_path_tts:
+                print("❌ Speech synthesis failed!")
+                logging.error("Failed to generate speech")
+                get_voice_handler().cleanup_temp_files(audio_path)
+                return
+            
+            # 5. Send voice reply to recipient (upload file to WhatsApp)
+            print(f"📤 Step 5: Uploading and sending voice reply to {recipient}...")
+            result = send_audio_reply(recipient, audio_path_tts)
+            print(f"📤 Send result: {result}")
+            
+            if result:
+                logging.info(f"✅ Voice reply sent to {recipient}")
+            else:
+                logging.error("Failed to send voice reply")
+            
+            # Clean up downloaded audio files
+            get_voice_handler().cleanup_temp_files(audio_path)
+            get_voice_handler().cleanup_temp_files(audio_path_tts)
+            
+        except Exception as e:
+            print(f"❌ EXCEPTION in voice handler: {e}")
+            print(f"❌ Exception type: {type(e).__name__}")
+            import traceback
+            print(f"❌ Traceback: {traceback.format_exc()}")
+            logging.error(f"❌ Error processing voice message: {e}")
+    
+    elif message_type == "text":
+        # Handle text message (existing logic)
+        message_body = message["text"]["body"]
+        logging.info(f"📩 Text message from {name} ({wa_id}): {message_body}")
+
+        # Gemini Integration with RAG
+        response = generate_response(message_body, wa_id, name)
+        response = process_text_for_whatsapp(response)
+
+        logging.info(f"📤 Sending text reply to {recipient}: {response}")
+        
+        # Send text message to RECIPIENT_WAID (configured in .env)
+        data = get_text_message_input(recipient, response)
+        send_message(data)
+    
+    else:
+        # Handle other message types
+        logging.info(f"⚠️ Unsupported message type: {message_type} from {name} ({wa_id})")
+        logging.info("Supported types: text, audio")
+
+
+def is_valid_whatsapp_message(body):
+    """
+    Check if the incoming webhook event has a valid WhatsApp message structure.
+    """
+    return (
+        body.get("object")
+        and body.get("entry")
+        and body["entry"][0].get("changes")
+        and body["entry"][0]["changes"][0].get("value")
+        and body["entry"][0]["changes"][0]["value"].get("messages")
+        and body["entry"][0]["changes"][0]["value"]["messages"][0]
+    )
