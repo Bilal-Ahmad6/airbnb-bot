@@ -42,9 +42,13 @@ def send_message(data):
     url = f"https://graph.facebook.com/{current_app.config['VERSION']}/{current_app.config['PHONE_NUMBER_ID']}/messages"
 
     try:
+        print(f"📤 Sending to WhatsApp API: {url}")
+        print(f"📤 Payload: {data}")
         response = requests.post(
             url, data=data, headers=headers, timeout=10
         )  # 10 seconds timeout as an example
+        print(f"📤 Response status: {response.status_code}")
+        print(f"📤 Response body: {response.text}")
         response.raise_for_status()  # Raises an HTTPError if the HTTP request returned an unsuccessful status code
     except requests.Timeout:
         logging.error("Timeout occurred while sending message")
@@ -53,6 +57,10 @@ def send_message(data):
         requests.RequestException
     ) as e:  # This will catch any general request exception
         logging.error(f"Request failed due to: {e}")
+        print(f"❌ WhatsApp API Error: {e}")
+        if hasattr(e.response, 'text'):
+            print(f"❌ Error response body: {e.response.text}")
+            logging.error(f"❌ Error response: {e.response.text}")
         return jsonify({"status": "error", "message": "Failed to send message"}), 500
     else:
         # Process the response as normal
@@ -105,10 +113,12 @@ def process_whatsapp_message(body):
     
     # Get message type
     message_type = message.get("type")
-    recipient = current_app.config["RECIPIENT_WAID"]
+    # Send response back to the sender's WhatsApp number
+    # wa_id comes without '+' prefix, so we need to add it
+    recipient = f"+{wa_id}" if not wa_id.startswith('+') else wa_id
     
     print(f"🔍 DEBUG: Message type = '{message_type}'")
-    print(f"🔍 DEBUG: Recipient = '{recipient}'")
+    print(f"🔍 DEBUG: Recipient (sender) = '{recipient}'")
     logging.info(f"🔍 DEBUG: Message type = '{message_type}'")
     logging.info(f"🔍 DEBUG: Message keys = {list(message.keys())}")
     logging.info(f"🔍 DEBUG: Full message = {json.dumps(message, indent=2)}")
@@ -190,18 +200,25 @@ def process_whatsapp_message(body):
     
     elif message_type == "text":
         # Handle text message (existing logic)
+        print("📝 TEXT MESSAGE DETECTED!")
         message_body = message["text"]["body"]
+        print(f"📩 Text message from {name} ({wa_id}): {message_body}")
         logging.info(f"📩 Text message from {name} ({wa_id}): {message_body}")
 
         # Gemini Integration with RAG
+        print("🤖 Generating AI response with Gemini + RAG...")
         response = generate_response(message_body, wa_id, name)
+        print(f"🤖 AI Response generated: {response}")
         response = process_text_for_whatsapp(response)
+        print(f"✅ Response formatted for WhatsApp: {response}")
 
         logging.info(f"📤 Sending text reply to {recipient}: {response}")
+        print(f"📤 Sending text reply to {recipient}...")
         
-        # Send text message to RECIPIENT_WAID (configured in .env)
+        # Send text message to the sender
         data = get_text_message_input(recipient, response)
-        send_message(data)
+        result = send_message(data)
+        print(f"📤 Send result: {result}")
     
     else:
         # Handle other message types
